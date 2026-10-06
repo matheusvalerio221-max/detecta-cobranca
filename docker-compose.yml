@@ -1,0 +1,15 @@
+# Detecta Cobrança — roda ao lado do Detecta Rede e usa o mesmo Caddy (HTTPS).
+services:
+  cobranca:
+    build: .
+    container_name: detecta-cobranca
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    networks: [rede]
+
+networks:
+  rede:
+    name: detecta-rede_default
+    external: true

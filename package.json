@@ -1,0 +1,9 @@
+{
+  "name": "detecta-cobranca",
+  "version": "1.0.0",
+  "description": "Detecta Cobrança — acompanhamento automático de propostas enviadas pelo Bradial Chat (Node 22, sem dependências externas)",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": { "start": "node --no-warnings src/server.js", "test": "node --no-warnings --test test/*.test.js" }
+}

@@ -60,10 +60,32 @@ CREATE TABLE IF NOT EXISTS eventos_brutos (
 );
 `;
 
+// Colunas acrescentadas depois da primeira versão (ALTER TABLE só se faltar).
+const EXTRAS = [
+  ['cobrancas', 'plano TEXT'], // JSON: horários previstos das cobranças que faltam
+  ['cobrancas', 'etapa INTEGER NOT NULL DEFAULT 0'], // quantas já saíram
+  ['cobrancas', 'ultima_enviada_em INTEGER'],
+  ['cobrancas', 'classificacao TEXT'], // última leitura da resposta do cliente
+  ['envios', 'canal TEXT'], // texto | modelo
+];
+
 export function abrirBanco(caminho) {
   const db = new DatabaseSync(caminho);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
   db.exec(ESQUEMA);
+  for (const [tabela, coluna] of EXTRAS) {
+    const nome = coluna.split(' ')[0];
+    const existe = db.prepare(`PRAGMA table_info(${tabela})`).all().some((c) => c.name === nome);
+    if (!existe) db.exec(`ALTER TABLE ${tabela} ADD COLUMN ${coluna}`);
+  }
+  // Cobranças abertas pela versão anterior: converte 1ª/2ª no novo plano.
+  for (const c of db.prepare("SELECT * FROM cobrancas WHERE plano IS NULL AND estado = 'ativa'").all()) {
+    const plano = [c.primeira_enviada_em ? null : c.primeira_em, c.segunda_enviada_em ? null : c.segunda_em].filter((t) => t != null);
+    const etapa = (c.primeira_enviada_em ? 1 : 0) + (c.segunda_enviada_em ? 1 : 0);
+    db.prepare('UPDATE cobrancas SET plano = ?, etapa = ?, ultima_enviada_em = ? WHERE id = ?').run(
+      JSON.stringify(plano), etapa, c.segunda_enviada_em || c.primeira_enviada_em || null, c.id,
+    );
+  }
   const q = (sql) => db.prepare(sql);
   return {
     raw: db,

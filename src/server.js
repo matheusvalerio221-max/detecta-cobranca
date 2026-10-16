@@ -14,7 +14,7 @@ import { abrirBanco } from './db.js';
 import { criarHorario } from './horario.js';
 import { criarBradial } from './bradial.js';
 import { criarIA } from './ia.js';
-import { criarMotor } from './motor.js';
+import { criarMotor, MODELO_PADRAO } from './motor.js';
 
 const env = process.env;
 const lista = (v) => String(v || '').split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
@@ -46,6 +46,8 @@ const PADRAO = {
   agenda: env.AGENDA_TEXTO || '',
   proposta_regex: env.PROPOSTA_REGEX || 'P[A-Z]\\d{2}-\\d{3}',
   proposta_etiqueta: env.PROPOSTA_ETIQUETA || '',
+  modelo_nome: env.MODELO_NOME || '',
+  modelo_corpo: env.MODELO_CORPO || MODELO_PADRAO.corpo,
 };
 function lerConfig() {
   const salvo = Object.fromEntries(db.all('SELECT chave, valor FROM config').map((l) => [l.chave, l.valor]));
@@ -84,6 +86,7 @@ function montar() {
       etiquetaProposta: cfg.proposta_etiqueta,
       caixasPermitidas: lista(cfg.caixas).map(Number).filter(Boolean),
       somenteTelefones: lista(cfg.somente_telefones),
+      modelo: { nome: cfg.modelo_nome.trim(), corpo: cfg.modelo_corpo || MODELO_PADRAO.corpo },
     },
   });
 }
@@ -116,7 +119,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '
 const CSS = `body{font:14px system-ui,sans-serif;margin:24px;color:#1c2430;max-width:1200px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e3e7ee;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f4f6f9}
 .k{display:inline-block;margin:0 16px 16px 0;padding:10px 14px;background:#f4f6f9;border-radius:8px}.k b{display:block;font-size:20px}
-.e-respondida{color:#0a7a3d;font-weight:600}.e-sem_resposta{color:#b3261e}.e-ativa{color:#8a5a00}
+.e-respondida{color:#0a7a3d;font-weight:600}.e-aprovada{color:#0a7a3d;font-weight:700}.e-recusada{color:#b3261e;font-weight:600}.e-sem_resposta{color:#b3261e}.e-ativa{color:#8a5a00}
 .modo{padding:2px 8px;border-radius:6px;font-size:13px}.m-auto{background:#d9f2e3}.m-sombra{background:#fff1cc}
 nav a{margin-right:16px}label{display:block;margin:14px 0 4px;font-weight:600}input,select,textarea{font:inherit;padding:7px 9px;border:1px solid #c5ccd6;border-radius:6px;width:100%;max-width:520px;box-sizing:border-box}
 small{color:#5b6675;display:block;margin-top:3px;max-width:640px}button{font:inherit;padding:9px 16px;border:0;border-radius:6px;background:#1d5fd1;color:#fff;cursor:pointer;margin-top:18px}
@@ -132,31 +135,38 @@ function pagina(titulo, corpo) {
 function painel() {
   const linhas = db.all('SELECT c.*, v.contato FROM cobrancas c LEFT JOIN conversas v ON v.id = c.conversa_id ORDER BY c.id DESC LIMIT 200');
   const desde = Date.now() - 7 * 86_400_000;
-  const conta = (estado) => db.get('SELECT COUNT(*) n FROM cobrancas WHERE proposta_em >= ? AND estado = ?', desde, estado).n;
+  const conta = (...estados) => db.get(`SELECT COUNT(*) n FROM cobrancas WHERE proposta_em >= ? AND estado IN (${estados.map(() => '?').join(',')})`, desde, ...estados).n;
   const total = db.get('SELECT COUNT(*) n FROM cobrancas WHERE proposta_em >= ?', desde).n;
   const enviadas = db.get('SELECT COUNT(*) n FROM envios WHERE em >= ? AND ok = 1', desde).n;
   const eventos = db.get('SELECT COUNT(*) n, MAX(em) ultimo FROM eventos_brutos');
-  const rotulo = { ativa: 'Aguardando', respondida: 'Cliente respondeu', retomada: 'Atendente retomou', encerrada: 'Conversa finalizada', sem_resposta: 'Sem resposta', substituida: 'Nova proposta enviada' };
+  const rotulo = { ativa: 'Aguardando', aprovada: 'Cliente aprovou', recusada: 'Cliente recusou', respondida: 'Cliente respondeu', retomada: 'Atendente retomou', encerrada: 'Conversa finalizada', sem_resposta: 'Sem resposta', substituida: 'Nova proposta enviada' };
+  const leitura = { aprovou: 'aprovou', recusou: 'recusou', duvida: 'perguntou', pensar: 'vai analisar', recebeu: 'só confirmou', outro: 'respondeu' };
   const f = horario.formatar;
   const tr = linhas
-    .map(
-      (l) => `<tr><td>#${l.conversa_id}</td><td>${esc(l.contato)}</td><td>${esc(l.atendente)}</td><td>${esc(l.proposta_arquivo)}</td><td>${f(l.proposta_em)}</td>
-<td>${l.primeira_enviada_em ? '✔ ' + f(l.primeira_enviada_em) : f(l.primeira_em)}</td><td>${l.segunda_enviada_em ? '✔ ' + f(l.segunda_enviada_em) : f(l.segunda_em)}</td>
-<td>${f(l.janela_fim)}</td><td class="e-${l.estado}">${rotulo[l.estado] || l.estado}</td><td>${esc(l.ultimo_erro || '')}</td></tr>`,
-    )
+    .map((l) => {
+      const feitas = db.all('SELECT em, canal, ok FROM envios WHERE cobranca_id = ? ORDER BY em', l.id)
+        .map((e) => `${e.ok ? '✔' : '✖'} ${f(e.em)}${e.canal === 'modelo' ? ' <small style="display:inline">(modelo)</small>' : ''}`);
+      let previstas = [];
+      try { previstas = JSON.parse(l.plano || '[]').map((t) => f(t)); } catch { /* plano antigo */ }
+      if (!l.plano) previstas = [l.primeira_enviada_em ? null : l.primeira_em, l.segunda_enviada_em ? null : l.segunda_em].filter((t) => t != null).map((t) => f(t));
+      const cobrancas = [...feitas, ...(l.estado === 'ativa' ? previstas : [])].join('<br>') || '-';
+      const situacao = `${rotulo[l.estado] || l.estado}${l.classificacao && l.estado === 'ativa' ? `<br><small>cliente ${leitura[l.classificacao] || l.classificacao}</small>` : ''}`;
+      return `<tr><td>#${l.conversa_id}</td><td>${esc(l.contato)}</td><td>${esc(l.atendente)}</td><td>${esc(l.proposta_arquivo)}</td><td>${f(l.proposta_em)}</td>
+<td>${cobrancas}</td><td>${f(l.janela_fim)}</td><td class="e-${l.estado}">${situacao}</td><td>${esc(l.ultimo_erro || '')}</td></tr>`;
+    })
     .join('');
   const alerta = !cfg.bradial_chave
     ? `<p class="aviso">Falta a chave de API do Bradial. Abra <a href="${BASE}/configurar">Configuração</a>.</p>`
     : eventos.n === 0
       ? '<p class="aviso">Nenhum evento recebido do Bradial ainda. Confira o webhook em Configuração.</p>'
-      : `<p>Último evento do Bradial: ${f(eventos.ultimo)}</p>`;
+      : `<p>Último evento do Bradial: ${f(eventos.ultimo)}${cfg.modelo_nome ? '' : ' · <span class="aviso" style="padding:2px 8px">sem modelo aprovado: só cobra dentro da janela de 24h</span>'}</p>`;
   return pagina(
     'Acompanhamento',
     `${alerta}<h2>Últimos 7 dias</h2>
-<div><span class="k"><b>${total}</b>propostas detectadas</span><span class="k"><b>${enviadas}</b>cobranças feitas</span><span class="k"><b>${conta('respondida')}</b>clientes responderam</span>
+<div><span class="k"><b>${total}</b>propostas detectadas</span><span class="k"><b>${enviadas}</b>cobranças feitas</span><span class="k"><b>${conta('aprovada')}</b>aprovaram</span><span class="k"><b>${conta('respondida', 'recusada')}</b>responderam</span>
 <span class="k"><b>${conta('retomada')}</b>atendente retomou</span><span class="k"><b>${conta('sem_resposta')}</b>sem resposta</span><span class="k"><b>${conta('ativa')}</b>aguardando</span></div>
-<table><tr><th>Conversa</th><th>Contato</th><th>Atendente</th><th>Proposta</th><th>Enviada</th><th>1ª cobrança</th><th>2ª cobrança</th><th>Janela fecha</th><th>Situação</th><th>Erro</th></tr>${tr}</table>
-<p><small>Horários em Brasília. ✔ = cobrança já feita. Sem ✔ = horário previsto.</small></p>`,
+<table><tr><th>Conversa</th><th>Contato</th><th>Atendente</th><th>Proposta</th><th>Enviada</th><th>Cobranças</th><th>Janela fecha</th><th>Situação</th><th>Erro</th></tr>${tr}</table>
+<p><small>Horários em Brasília. ✔ = cobrança feita, ✖ = falhou, sem marca = prevista. Até 4 cobranças: 2h após a proposta, 4h depois, abertura do dia seguinte e antes de fechar a janela de 24h.</small></p>`,
   );
 }
 
@@ -202,6 +212,12 @@ ${https ? '' : '<p class="erro">Esta página está sem HTTPS. Não salve chaves 
 <label>Etiqueta que também dispara a cobrança</label>
 <input name="proposta_etiqueta" value="${esc(cfg.proposta_etiqueta)}" placeholder="opcional, ex.: proposta-enviada">
 <small>O disparo principal é o PDF da proposta (nome como PE09-184 ou PC10-001) enviado pela atendente.</small>
+<label>Modelo aprovado na Meta para cobrar depois da janela de 24h</label>
+<input name="modelo_nome" value="${esc(cfg.modelo_nome)}" placeholder="ex.: acompanhamento_proposta (em branco = só cobra dentro da janela)">
+<small>Nome exato do modelo, como aparece no Gerenciador do WhatsApp. Só preencha depois de aprovado. "Salvar e testar" confere o status.</small>
+<label>Texto do modelo (para a atendente ver o que foi enviado)</label>
+<textarea name="modelo_corpo" rows="3">${esc(cfg.modelo_corpo)}</textarea>
+<small>{{1}} = primeiro nome do cliente, {{2}} = número da proposta. Precisa ser igual ao texto aprovado.</small>
 <button type="submit">Salvar</button> <button type="submit" name="acao" value="testar" style="background:#44546a">Salvar e testar conexão com o Bradial</button>
 </form>`,
   );
@@ -270,9 +286,10 @@ const servidor = http.createServer(async (req, res) => {
         if (!mesmaOrigem(req)) return enviar(403, { erro: 'origem inválida' });
         const form = new URLSearchParams(await lerCorpo(req, 50_000));
         const salvar = (k, v) => db.run('INSERT INTO config (chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = excluded.valor', k, v);
-        for (const k of ['somente_telefones', 'caixas', 'feriados', 'agenda', 'proposta_etiqueta', 'dias_uteis']) {
+        for (const k of ['somente_telefones', 'caixas', 'feriados', 'agenda', 'proposta_etiqueta', 'dias_uteis', 'modelo_nome']) {
           if (form.has(k)) salvar(k, form.get(k).trim().slice(0, 500));
         }
+        if (form.has('modelo_corpo')) salvar('modelo_corpo', form.get('modelo_corpo').trim().slice(0, 1200) || MODELO_PADRAO.corpo);
         for (const k of ['horario_inicio', 'horario_fim']) {
           const v = (form.get(k) || '').trim();
           if (/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) salvar(k, v);
@@ -290,6 +307,20 @@ const servidor = http.createServer(async (req, res) => {
             const itens = Array.isArray(r) ? r : r?.data || r?.payload || r?.items || [];
             const nomes = itens.map((i) => `${i.name} (ID ${i.id})`).join(', ');
             aviso = `<p class="ok">Configuração salva. Conexão com o Bradial funcionando.${nomes ? ' Caixas de entrada: ' + esc(nomes) : ''}</p>`;
+            if (cfg.modelo_nome) {
+              const inbox = lista(cfg.caixas).map(Number).filter(Boolean)[0];
+              try {
+                const m = await bradial.modelo({ inboxId: inbox, nome: cfg.modelo_nome });
+                const dado = Array.isArray(m) ? m[0] : m?.data || m;
+                const status = dado?.status || '(sem status)';
+                const corpo = (dado?.components || []).find((x) => x.type === 'BODY')?.text || '';
+                aviso += status === 'APPROVED'
+                  ? `<p class="ok">Modelo <code>${esc(cfg.modelo_nome)}</code> aprovado.${corpo && corpo !== cfg.modelo_corpo ? ' Atenção: o texto aprovado é diferente do texto salvo aqui: <code>' + esc(corpo) + '</code>' : ''}</p>`
+                  : `<p class="aviso">Modelo <code>${esc(cfg.modelo_nome)}</code> com status ${esc(status)}. Enquanto não estiver APPROVED, os envios pelo modelo vão falhar.</p>`;
+              } catch (e) {
+                aviso += `<p class="erro">Não consegui consultar o modelo <code>${esc(cfg.modelo_nome)}</code>: ${esc(e.message)}</p>`;
+              }
+            }
           } catch (e) {
             aviso = `<p class="erro">Configuração salva, mas a conexão com o Bradial falhou: ${esc(e.message)}</p>`;
           }
@@ -312,7 +343,7 @@ const servidor = http.createServer(async (req, res) => {
 });
 
 servidor.listen(PORTA, () => {
-  console.log(`[cobranca] porta ${PORTA} | modo=${cfg.modo} | envio ${cfg.horario_inicio}-${cfg.horario_fim} | Bradial=${cfg.bradial_chave ? 'ok' : 'SEM CHAVE'} | IA=${cfg.ia_chave ? 'ligada' : 'texto padrão'}`);
+  console.log(`[cobranca] porta ${PORTA} | modo=${cfg.modo} | modelo=${cfg.modelo_nome || 'nenhum'} | envio ${cfg.horario_inicio}-${cfg.horario_fim} | Bradial=${cfg.bradial_chave ? 'ok' : 'SEM CHAVE'} | IA=${cfg.ia_chave ? 'ligada' : 'texto padrão'}`);
 });
 
 let rodando = false;

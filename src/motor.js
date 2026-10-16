@@ -4,12 +4,23 @@
 //   sombra - NÃO envia nada ao cliente. Grava a sugestão como mensagem privada
 //            na conversa, para a atendente ver e enviar se concordar.
 //   auto   - envia a cobrança ao cliente pela API oficial do WhatsApp.
+//
+// Canais de envio:
+//   texto  - texto livre (escrito pela IA ou padrão), só dentro da janela de 24h
+//   modelo - modelo aprovado pela Meta, usado quando a janela já fechou
 
-import { planejar, PADRAO } from './regras.js';
+import { planejar, janelaAberta, PADRAO } from './regras.js';
 import { normalizar } from './normalizar.js';
+import { primeiroNome } from './ia.js';
 
 const MIN = 60_000;
+const H = 60 * MIN;
 const limpar = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+export const MODELO_PADRAO = {
+  nome: '',
+  corpo: 'Olá, {{1}}! Aqui é da equipe comercial da Detecta. Enviamos a proposta {{2}} e gostaríamos de saber se conseguiu avaliá-la. Ficou alguma dúvida ou há algo que possamos ajustar para fecharmos? Fico à disposição.',
+};
 
 export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => Date.now(), log = console }) {
   const c = {
@@ -18,14 +29,22 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     etiquetaProposta: '', // opcional: etiqueta que também dispara a cobrança
     caixasPermitidas: [], // vazio = todas
     somenteTelefones: [], // vazio = todos; preenchido = modo de teste
-    carenciaRetomadaMs: 10 * MIN, // mensagens da atendente logo após a proposta não contam como retomada
+    modelo: MODELO_PADRAO, // { nome, corpo } — nome vazio = sem modelo (só dentro da janela)
     historico: 30, // mensagens enviadas à IA como contexto
     reterDias: 90,
     regras: PADRAO,
     ...cfg,
   };
+  const comModelo = () => Boolean(c.modelo && c.modelo.nome);
   const digitos = (s) => String(s || '').replace(/\D/g, '');
   const telefonesTeste = c.somenteTelefones.map(digitos).filter(Boolean);
+  const plano = (cob) => {
+    try {
+      return JSON.parse(cob.plano || '[]');
+    } catch {
+      return [];
+    }
+  };
 
   function conversaPermitida(conv) {
     if (!conv.id) return false;
@@ -70,23 +89,37 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     }
   }
 
+  const descrever = (etapas) => etapas.map((t) => horario.formatar(t)).join(', ') || 'nenhuma';
+
   function abrirCobranca(conv, propostaEm, arquivo, autor) {
     const anterior = cobrancaAtiva(conv.id);
     if (anterior) encerrar(anterior, 'substituida', propostaEm);
     const reg = db.get('SELECT * FROM conversas WHERE id = ?', conv.id);
-    const plano = planejar({
-      propostaEm,
-      ultimoClienteEm: reg?.ultimo_cliente_em ?? null,
+    const p = planejar({ inicioEm: propostaEm, ultimoClienteEm: reg?.ultimo_cliente_em ?? null, horario, cfg: c.regras, comModelo: comModelo() });
+    db.run(
+      'INSERT INTO cobrancas (conversa_id, proposta_em, proposta_arquivo, atendente, primeira_em, segunda_em, janela_fim, plano, etapa) VALUES (?,?,?,?,?,?,?,?,0)',
+      conv.id, propostaEm, arquivo || null, autor || conv.atendente || null, p.etapas[0] ?? null, p.etapas[1] ?? null, p.janelaFim, JSON.stringify(p.etapas),
+    );
+    log.info(`[proposta] conversa ${conv.id} (${conv.contato}) arquivo=${arquivo || '-'} cobranças=${descrever(p.etapas)} janela=${horario.formatar(p.janelaFim)}`);
+  }
+
+  /** Cliente escreveu sem decidir: refaz os horários que faltam a partir de agora. */
+  function replanejar(cob, clienteEm, adiar) {
+    const faltam = c.regras.maximo - cob.etapa;
+    const p = planejar({
+      inicioEm: clienteEm,
+      propostaEm: cob.proposta_em,
+      ultimoClienteEm: clienteEm,
       horario,
       cfg: c.regras,
+      comModelo: comModelo(),
+      quantas: faltam,
+      adiar,
     });
-    db.run(
-      'INSERT INTO cobrancas (conversa_id, proposta_em, proposta_arquivo, atendente, primeira_em, segunda_em, janela_fim) VALUES (?,?,?,?,?,?,?)',
-      conv.id, propostaEm, arquivo || null, autor || conv.atendente || null, plano.primeira, plano.segunda, plano.janelaFim,
-    );
-    log.info(
-      `[proposta] conversa ${conv.id} (${conv.contato}) arquivo=${arquivo || '-'} 1ª=${horario.formatar(plano.primeira)} 2ª=${horario.formatar(plano.segunda)} janela=${horario.formatar(plano.janelaFim)}`,
-    );
+    // Nunca cobrar de novo em menos de 1h da última cobrança.
+    const etapas = p.etapas.filter((t) => !cob.ultima_enviada_em || t >= cob.ultima_enviada_em + c.regras.minEntreMs);
+    db.run('UPDATE cobrancas SET plano = ?, janela_fim = ? WHERE id = ?', JSON.stringify(etapas), p.janelaFim, cob.id);
+    log.info(`[replanejada] conversa ${cob.conversa_id} ${adiar ? '(cliente pediu tempo)' : '(cliente só acusou recebimento)'} cobranças=${descrever(etapas)}`);
   }
 
   /** Um envio recente nosso com o mesmo texto? Então a mensagem que chegou é o eco da nossa cobrança. */
@@ -100,6 +133,39 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     });
   }
 
+  function historico(conversaId) {
+    return db
+      .all("SELECT tipo, autor, texto, anexos FROM mensagens WHERE conversa_id = ? AND tipo IN ('cliente','atendente','auto') ORDER BY em DESC LIMIT ?", conversaId, c.historico)
+      .reverse();
+  }
+
+  async function clienteRespondeu(conv, cob, m) {
+    const { categoria, origem } = await ia.classificar({ textoCliente: m.texto, mensagens: historico(conv.id) });
+    db.run('UPDATE cobrancas SET classificacao = ? WHERE id = ?', categoria, cob.id);
+    const cobrado = cob.etapa > 0;
+    log.info(`[cliente] conversa ${conv.id} leitura=${categoria} (${origem}) cobranças feitas=${cob.etapa}`);
+
+    if (categoria === 'aprovou') {
+      encerrar(cob, 'aprovada', m.em);
+      await nota(conv.id, '🤖 Cobrança automática: o cliente APROVOU a proposta. Favor confirmar e agendar o serviço.');
+      return;
+    }
+    if (categoria === 'recusou') {
+      encerrar(cob, 'recusada', m.em);
+      await nota(conv.id, '🤖 Cobrança automática: o cliente indicou que NÃO vai seguir com a proposta. Favor verificar se cabe uma contraproposta.');
+      return;
+    }
+    if (categoria === 'recebeu' || categoria === 'pensar') {
+      replanejar(cob, m.em, categoria === 'pensar');
+      return;
+    }
+    // duvida | outro: alguém precisa responder; a cobrança automática para aqui.
+    encerrar(cob, 'respondida', m.em);
+    if (cobrado) {
+      await nota(conv.id, '🤖 Cobrança automática: o cliente respondeu depois da cobrança da proposta. Favor retomar a negociação.');
+    }
+  }
+
   async function tratarMensagem(m) {
     const conv = m.conversa;
     if (!conversaPermitida(conv)) return 'ignorada';
@@ -110,7 +176,7 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     if (m.privada) tipo = 'privada';
     else if (m.tipo === 'entrada') tipo = 'cliente';
     else if (m.humano && !ehEco(conv.id, m.texto, m.em)) tipo = 'atendente';
-    else if (m.tipo === 'saida' && ehEco(conv.id, m.texto, m.em)) tipo = 'auto';
+    else if ((m.tipo === 'saida' || m.tipo === 'modelo') && ehEco(conv.id, m.texto, m.em)) tipo = 'auto';
     else tipo = 'sistema'; // robô de menu, modelos, automações
 
     if (Number.isFinite(m.id)) {
@@ -123,13 +189,7 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     if (tipo === 'cliente') {
       db.run('UPDATE conversas SET ultimo_cliente_em = ?, pode_responder = 1 WHERE id = ?', m.em, conv.id);
       const cob = cobrancaAtiva(conv.id);
-      if (cob && m.em >= cob.proposta_em) {
-        encerrar(cob, 'respondida', m.em);
-        if (cob.primeira_enviada_em || cob.segunda_enviada_em) {
-          await nota(conv.id, '🤖 Cobrança automática: o cliente respondeu depois da cobrança da proposta. Favor retomar a negociação.');
-        }
-        log.info(`[respondida] conversa ${conv.id}`);
-      }
+      if (cob && m.em >= cob.proposta_em) await clienteRespondeu(conv, cob, m);
       return 'cliente';
     }
 
@@ -141,9 +201,18 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
         return 'proposta';
       }
       const cob = cobrancaAtiva(conv.id);
-      if (cob && m.em > cob.proposta_em + c.carenciaRetomadaMs) {
-        encerrar(cob, 'retomada', m.em);
-        log.info(`[retomada] conversa ${conv.id} por ${m.autor}`);
+      if (cob) {
+        // Só conta como retomada se a atendente está respondendo ao cliente:
+        // o cliente escreveu depois da proposta e ela escreveu depois dele.
+        // "Fico à disposição" logo após a proposta não cancela nada.
+        const clienteDepois = db.get(
+          "SELECT MAX(em) em FROM mensagens WHERE conversa_id = ? AND tipo = 'cliente' AND em >= ? AND em < ?",
+          conv.id, cob.proposta_em, m.em,
+        );
+        if (clienteDepois?.em != null) {
+          encerrar(cob, 'retomada', m.em);
+          log.info(`[retomada] conversa ${conv.id} por ${m.autor}`);
+        }
       }
       return 'atendente';
     }
@@ -162,7 +231,7 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     }
     if (!cob && c.etiquetaProposta && conv.etiquetas.includes(c.etiquetaProposta)) {
       // Disparo alternativo por etiqueta, uma vez por conversa a cada 24h.
-      const recente = db.get('SELECT id FROM cobrancas WHERE conversa_id = ? AND proposta_em >= ?', conv.id, t - 24 * 60 * MIN);
+      const recente = db.get('SELECT id FROM cobrancas WHERE conversa_id = ? AND proposta_em >= ?', conv.id, t - 24 * H);
       if (!recente) {
         abrirCobranca(conv, t, `etiqueta ${c.etiquetaProposta}`, conv.atendente);
         return 'proposta';
@@ -180,39 +249,51 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     return 'ignorada';
   }
 
-  async function cobrar(cob, numero, t) {
-    const conv = db.get('SELECT * FROM conversas WHERE id = ?', cob.conversa_id);
-    const coluna = numero === 1 ? 'primeira_enviada_em' : 'segunda_enviada_em';
-    // Marca antes de enviar: se algo falhar no meio, não corre o risco de cobrar duas vezes.
-    db.run(`UPDATE cobrancas SET ${coluna} = ? WHERE id = ?`, t, cob.id);
+  const codigoProposta = (arquivo) => {
+    const m = String(arquivo || '').match(c.regexProposta);
+    return m ? m[0].toUpperCase() : 'de orçamento';
+  };
 
-    const mensagens = db
-      .all("SELECT tipo, autor, texto, anexos FROM mensagens WHERE conversa_id = ? AND tipo IN ('cliente','atendente','auto') ORDER BY em DESC LIMIT ?", cob.conversa_id, c.historico)
-      .reverse();
-    const { texto, origem } = await ia.redigir({
-      contato: conv.contato,
-      atendente: cob.atendente,
-      numero,
-      arquivo: cob.proposta_arquivo,
-      mensagens,
-    });
+  function textoModelo(conv, cob) {
+    const nome = primeiroNome(conv.contato) || 'tudo bem';
+    const parametros = [nome, codigoProposta(cob.proposta_arquivo)];
+    const texto = String(c.modelo.corpo || MODELO_PADRAO.corpo).replace(/\{\{(\d+)\}\}/g, (_, i) => parametros[Number(i) - 1] ?? '');
+    return { texto, parametros };
+  }
+
+  async function cobrar(cob, numero, t, canal) {
+    const conv = db.get('SELECT * FROM conversas WHERE id = ?', cob.conversa_id);
+    // Marca antes de enviar: se algo falhar no meio, não corre o risco de cobrar duas vezes.
+    const coluna = numero === 1 ? 'primeira_enviada_em' : numero === 2 ? 'segunda_enviada_em' : null;
+    db.run(`UPDATE cobrancas SET etapa = ?, ultima_enviada_em = ?${coluna ? `, ${coluna} = ?` : ''} WHERE id = ?`, ...(coluna ? [numero, t, t, cob.id] : [numero, t, cob.id]));
+
+    let texto;
+    let origem;
+    let parametros = [];
+    if (canal === 'modelo') {
+      ({ texto, parametros } = textoModelo(conv, cob));
+      origem = 'modelo';
+    } else {
+      ({ texto, origem } = await ia.redigir({ contato: conv.contato, atendente: cob.atendente, numero, arquivo: cob.proposta_arquivo, mensagens: historico(cob.conversa_id) }));
+    }
 
     // Registra o envio ANTES de chamar a API: o Bradial devolve a própria mensagem
     // pelo webhook, e ela precisa ser reconhecida como nossa (e não como a
     // atendente retomando a conversa) mesmo que chegue antes da resposta da API.
     const envio = db.run(
-      'INSERT INTO envios (cobranca_id, conversa_id, em, numero, modo, origem_texto, texto, ok) VALUES (?,?,?,?,?,?,?,1)',
-      cob.id, conv.id, t, numero, c.modo, origem, texto,
+      'INSERT INTO envios (cobranca_id, conversa_id, em, numero, modo, origem_texto, texto, ok, canal) VALUES (?,?,?,?,?,?,?,1,?)',
+      cob.id, conv.id, t, numero, c.modo, origem, texto, canal,
     );
     let ok = 1;
     let erro = null;
     try {
       if (c.modo === 'auto') {
-        await bradial.enviarTexto({ inboxId: conv.inbox_id, telefone: conv.telefone, texto });
+        if (canal === 'modelo') await bradial.enviarModelo({ inboxId: conv.inbox_id, telefone: conv.telefone, modelo: c.modelo.nome, parametros });
+        else await bradial.enviarTexto({ inboxId: conv.inbox_id, telefone: conv.telefone, texto });
       } else {
         await bradial.notaPrivada({
           conversaId: conv.id,
-          texto: `🤖 Sugestão de ${numero}ª cobrança da proposta (NÃO enviada ao cliente — modo de teste):\n\n${texto}`,
+          texto: `🤖 Sugestão de ${numero}ª cobrança da proposta${canal === 'modelo' ? ' (pelo modelo aprovado, janela de 24h fechada)' : ''} (NÃO enviada ao cliente — modo de teste):\n\n${texto}`,
         });
       }
     } catch (e) {
@@ -222,12 +303,12 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     }
     if (!ok) {
       db.run('UPDATE cobrancas SET ultimo_erro = ? WHERE id = ?', erro, cob.id);
-      log.warn(`[falha] conversa ${conv.id} ${numero}ª cobrança: ${erro}`);
+      log.warn(`[falha] conversa ${conv.id} ${numero}ª cobrança (${canal}): ${erro}`);
       if (c.modo === 'auto') {
         await nota(conv.id, `🤖 Cobrança automática: não consegui enviar a ${numero}ª cobrança ao cliente (${String(erro).slice(0, 120)}). Favor cobrar manualmente.`);
       }
     } else {
-      log.info(`[cobrança ${numero}] conversa ${conv.id} (${conv.contato}) modo=${c.modo} texto=${origem}`);
+      log.info(`[cobrança ${numero}] conversa ${conv.id} (${conv.contato}) modo=${c.modo} canal=${canal} texto=${origem}`);
     }
     return ok === 1;
   }
@@ -238,32 +319,41 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
     const ativas = db.all("SELECT * FROM cobrancas WHERE estado = 'ativa'");
     let enviados = 0;
     for (const cob of ativas) {
-      const limite = cob.janela_fim != null ? cob.janela_fim - c.regras.margemMs : null;
-      const janelaAberta = limite == null || t <= limite;
+      const conv = db.get('SELECT * FROM conversas WHERE id = ?', cob.conversa_id);
+      const etapas = plano(cob);
+      const vencidas = etapas.filter((e) => e <= t);
+      // Janela: pela última mensagem do cliente que vimos; se nunca vimos nenhuma,
+      // vale o can_reply que o Bradial informa na conversa.
+      const ultimoCliente = conv?.ultimo_cliente_em ?? null;
+      const aberta = conv?.pode_responder !== 0 && (ultimoCliente == null ? conv?.pode_responder === 1 : janelaAberta({ ultimoClienteEm: ultimoCliente, t, cfg: c.regras }));
 
-      const devePrimeira = cob.primeira_em != null && !cob.primeira_enviada_em && t >= cob.primeira_em;
-      const deveSegunda =
-        cob.segunda_em != null && !cob.segunda_enviada_em && t >= cob.segunda_em &&
-        (cob.primeira_enviada_em == null || t >= cob.primeira_enviada_em + c.regras.minEntreMs);
-
-      if ((devePrimeira || deveSegunda) && janelaAberta && horario.aberto(t)) {
-        // Se as duas venceram juntas (serviço ficou parado), manda só uma.
-        const numero = deveSegunda && (cob.primeira_enviada_em || !devePrimeira) ? 2 : 1;
-        if (numero === 1 && deveSegunda) db.run('UPDATE cobrancas SET segunda_em = NULL WHERE id = ?', cob.id);
-        await cobrar(cob, numero, t);
-        enviados++;
-        continue;
+      if (vencidas.length && horario.aberto(t) && (!cob.ultima_enviada_em || t >= cob.ultima_enviada_em + c.regras.minEntreMs)) {
+        const canal = aberta ? 'texto' : comModelo() ? 'modelo' : null;
+        // Se várias venceram juntas (serviço parado), manda só uma e descarta as outras.
+        const restantes = etapas.filter((e) => e > t);
+        db.run('UPDATE cobrancas SET plano = ? WHERE id = ?', JSON.stringify(restantes), cob.id);
+        if (canal) {
+          await cobrar(cob, cob.etapa + 1, t, canal);
+          enviados++;
+          continue;
+        }
+        log.info(`[pulada] conversa ${cob.conversa_id}: janela fechada e sem modelo aprovado`);
       }
 
-      // Encerramento: nada mais a enviar, ou a janela fechou.
+      // Encerramento: nada mais a enviar e a janela (ou um dia desde a última cobrança) passou.
       const atual = db.get('SELECT * FROM cobrancas WHERE id = ?', cob.id);
-      const pendente =
-        (atual.primeira_em != null && !atual.primeira_enviada_em) || (atual.segunda_em != null && !atual.segunda_enviada_em);
-      const fimDaLinha = atual.janela_fim != null ? t > atual.janela_fim : !pendente && t > (atual.primeira_enviada_em || atual.proposta_em) + 24 * 60 * MIN;
-      if (fimDaLinha || (!pendente && atual.janela_fim == null && atual.primeira_em == null)) {
+      const pendentes = plano(atual);
+      const umDia = (atual.ultima_enviada_em ?? atual.proposta_em) + 24 * H;
+      // Com modelo, espera o cliente até um dia depois da última cobrança; sem modelo, até a janela fechar.
+      const esperaFim = comModelo() ? Math.max(atual.janela_fim ?? 0, umDia) : (atual.janela_fim ?? umDia);
+      const semSaida = pendentes.length === 0 || (!aberta && !comModelo());
+      if (semSaida && t > esperaFim) {
         encerrar(atual, 'sem_resposta', t);
-        if (atual.primeira_enviada_em || atual.segunda_enviada_em) {
-          await nota(atual.conversa_id, '🤖 Cobrança automática: proposta cobrada e o cliente não respondeu dentro da janela de 24h. Próximo contato só por modelo de mensagem ou ligação.');
+        if (atual.etapa > 0) {
+          await nota(
+            atual.conversa_id,
+            `🤖 Cobrança automática: proposta cobrada ${atual.etapa}x e o cliente não respondeu. Encerrando o acompanhamento automático; próximo contato por ligação ou mensagem da atendente.`,
+          );
         }
       }
     }
@@ -271,7 +361,7 @@ export function criarMotor({ db, horario, bradial, ia, cfg = {}, agora = () => D
   }
 
   function limparAntigos() {
-    const corte = agora() - c.reterDias * 24 * 60 * MIN;
+    const corte = agora() - c.reterDias * 24 * H;
     db.run('DELETE FROM mensagens WHERE em < ?', corte);
     db.run('DELETE FROM eventos_brutos WHERE id <= (SELECT COALESCE(MAX(id), 0) - 3000 FROM eventos_brutos)');
   }

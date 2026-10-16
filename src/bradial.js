@@ -42,6 +42,30 @@ export function criarBradial({ base = 'https://api.bradial.com.br', chave, timeo
       }
     },
 
+    /**
+     * Envia um modelo (template) aprovado pela Meta. Funciona fora da janela de 24h.
+     * `parametros` são os valores das variáveis do corpo, na ordem ({{1}}, {{2}}, ...).
+     */
+    async enviarModelo({ inboxId, telefone, modelo, parametros = [] }) {
+      const digitos = String(telefone || '').replace(/\D/g, '');
+      const caminho = `/v2/meta-api/inboxes/${inboxId}/whatsapp/messages/template`;
+      const body = Object.fromEntries(parametros.map((v, i) => [String(i + 1), String(v)]));
+      const corpo = (phone) => (parametros.length ? { phone, template: modelo, params: { body } } : { phone, template: modelo });
+      try {
+        return await chamar('POST', caminho, corpo(digitos));
+      } catch (e) {
+        if (e.status === 400 || e.status === 404 || e.status === 422) {
+          return await chamar('POST', caminho, corpo('+' + digitos));
+        }
+        throw e;
+      }
+    },
+
+    /** Dados de um modelo (status de aprovação, texto do corpo). */
+    async modelo({ inboxId, nome }) {
+      return chamar('GET', `/v2/meta-api/inboxes/${inboxId}/whatsapp/templates/${encodeURIComponent(nome)}`);
+    },
+
     /** Grava uma mensagem privada (visível só para a equipe) na conversa. */
     async notaPrivada({ conversaId, texto }) {
       return chamar('POST', `/v2/public-api/v1/conversations/${conversaId}/messages/private`, { content: texto });

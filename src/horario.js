@@ -64,6 +64,11 @@ export function criarHorario({
     return null;
   }
 
+  /** Abertura do próximo dia útil depois do dia que contém t. */
+  function proximoDia(t) {
+    return proximo(dia(t).base + DIA);
+  }
+
   /** Texto local 'DD/MM HH:MM' para notas e painel. */
   function formatar(t) {
     if (t == null) return '-';
@@ -72,5 +77,5 @@ export function criarHorario({
     return `${p(d.getUTCDate())}/${p(d.getUTCMonth() + 1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
   }
 
-  return { aberto, proximo, anterior, formatar };
+  return { aberto, proximo, anterior, proximoDia, formatar };
 }
